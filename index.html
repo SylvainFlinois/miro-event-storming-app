@@ -70,11 +70,14 @@
 <script>
 const IS_PANEL = new URLSearchParams(location.search).has('panel');
 const META = 'tagToggle';           // v1 : métadonnées par ticket (lu seulement pour migration)
-const APPDATA = 'dimmed';           // mode Recolorer : { [itemId]: couleurOrigine }
-const VEIL_KEY = 'veil';            // mode Voile : ids des voiles (un par frame)
+// NB : Miro FUSIONNE les objets passés à setAppData (une clé supprimée n'est jamais effacée).
+// On stocke donc tout en texte JSON, qui remplace entièrement la valeur précédente.
+const APPDATA = 'dimmed.v2';        // mode Recolorer : { [itemId]: couleurOrigine }
+const VEIL_KEY = 'veils.v2';        // mode Voile : ids des voiles (un par frame)
+const LEGACY = { dimmed: 'dimmed', veil: 'veil', coll: 'collapsible' };
 const CARD_DIM = '#e6e6e6';
 const DIM_COLORS = ['gray', 'white'];
-const COLL_KEY = 'collapsible';     // { [frameId]: { btn, collapsed, x, y } }
+const COLL_KEY = 'collapsible.v2';  // { [frameId]: { btn, collapsed, x, y } }
 const PARK_DX = 100000;             // décalage de la zone de rangement des frames repliées
 const MARGIN = 2000;                // le voile déborde de la zone utilisée
 const TAG_COLORS = { red:'#f24726', magenta:'#da0063', violet:'#9510ac', light_green:'#c9df56', green:'#8fd14f',
@@ -112,7 +115,13 @@ const tagsOf = (it) => it.tagIds || [];
 const isDimmed = (it) => it.id in dimmed;
 const colorOf = (it) => it.type === 'card' ? it.style.cardTheme : it.style.fillColor;
 const setColor = (it, c) => { if (it.type === 'card') it.style.cardTheme = c; else it.style.fillColor = c; };
-const saveDimmed = () => withRetry(() => miro.board.setAppData(APPDATA, dimmed));
+async function readJSON(key) {
+  const v = await withRetry(() => miro.board.getAppData(key));
+  if (typeof v === 'string') { try { return JSON.parse(v); } catch (_) {} }
+  return null;
+}
+const writeJSON = (key, value) => withRetry(() => miro.board.setAppData(key, JSON.stringify(value)));
+const saveDimmed = () => writeJSON(APPDATA, dimmed);
 // Sans tag => toujours visible ; sinon visible si au moins un de ses tags est allumé
 const shouldShow = (it) => tagsOf(it).length === 0 || tagsOf(it).some(id => active.has(id));
 const allIds = () => tags.map(t => t.id);
@@ -124,12 +133,22 @@ async function load() {
   allItems = await withRetry(() => miro.board.get());
   items = allItems.filter(it => it.type === 'sticky_note' || it.type === 'card');
   frames = allItems.filter(it => it.type === 'frame');
-  dimmed = (await withRetry(() => miro.board.getAppData(APPDATA))) || {};
+  dimmed = await readJSON(APPDATA);
+  if (!dimmed) {                       // reprise de l'ancien format : on ne garde que les tickets encore estompés
+    const old = (await withRetry(() => miro.board.getAppData(LEGACY.dimmed))) || {};
+    dimmed = {};
+    for (const it of items) {
+      const c = colorOf(it);
+      if (old[it.id] && (it.type === 'card' ? c === CARD_DIM : DIM_COLORS.includes(c))) dimmed[it.id] = old[it.id];
+    }
+    await saveDimmed();
+  }
   const ids = new Set(items.map(it => it.id));
   for (const id of Object.keys(dimmed)) if (!ids.has(id)) delete dimmed[id];
 
   // Voile existant ?
-  const veilIds = [].concat((await withRetry(() => miro.board.getAppData(VEIL_KEY))) || []);  // ancienne version : un seul id
+  let veilIds = await readJSON(VEIL_KEY);
+  if (!veilIds) veilIds = [].concat((await withRetry(() => miro.board.getAppData(LEGACY.veil))) || []);
   veils = veilIds.map(id => allItems.find(it => it.id === id)).filter(Boolean);
 
   // Migration v1 (métadonnées par ticket)
@@ -191,7 +210,7 @@ async function bringFront(list) {
 async function removeVeil() {
   for (const v of veils) { try { await withRetry(() => miro.board.remove(v)); } catch (e) { console.warn(e); } }
   veils = [];
-  await withRetry(() => miro.board.setAppData(VEIL_KEY, []));
+  await writeJSON(VEIL_KEY, []);
 }
 
 async function applyVeil() {
@@ -213,7 +232,7 @@ async function applyVeil() {
       style: { fillColor: '#ffffff', fillOpacity: opacity, borderOpacity: 0, borderWidth: 1 },
     }));
     veils.push(v);
-    await withRetry(() => miro.board.setAppData(VEIL_KEY, veils.map(x => x.id)));  // mémorisé tout de suite
+    await writeJSON(VEIL_KEY, veils.map(x => x.id));  // mémorisé tout de suite
     await withRetry(() => f.add(v));                             // le voile devient un enfant de la frame
     await withRetry(() => miro.board.bringToFront(v));
     const visibleChildren = allItems.filter(it => it.parentId === f.id && !hiddenIds.has(it.id) &&
@@ -247,8 +266,20 @@ async function restoreColors(scope = items) {
 // Déplier  = ramener la frame à sa position exacte, et remettre le bouton au-dessus.
 // Le bouton est une forme du board : quand quelqu'un la sélectionne, l'app (chargée en
 // arrière-plan à l'ouverture du board) replie / déplie la frame correspondante.
-const getColl = async () => (await withRetry(() => miro.board.getAppData(COLL_KEY))) || {};
-const setColl = (c) => withRetry(() => miro.board.setAppData(COLL_KEY, c));
+async function getColl() {
+  const c = await readJSON(COLL_KEY);
+  if (c) return c;
+  // reprise de l'ancien format : on ne garde que les frames dont le bouton existe encore
+  const old = (await withRetry(() => miro.board.getAppData(LEGACY.coll))) || {};
+  const fresh = {};
+  for (const [id, e] of Object.entries(old)) {
+    if (!e || !e.btn) continue;
+    try { await miro.board.getById(e.btn); await miro.board.getById(id); fresh[id] = e; } catch (_) {}
+  }
+  await setColl(fresh);
+  return fresh;
+}
+const setColl = (c) => writeJSON(COLL_KEY, c);
 const plainTitle = (f) => (f.title || '').replace(/<[^>]+>/g, '').trim() || 'Frame';
 const BTN_OPEN = { w: 260, h: 70 };
 const toggling = new Set();
