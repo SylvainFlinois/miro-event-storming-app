@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Toggle par tag</title>
+<script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+<style>
+  :root { --fg:#1a1a2e; --muted:#6b6b80; --line:#e4e4ec; --accent:#4262ff; --bg:#fff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; font:14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--fg); background:var(--bg); }
+  h1 { font-size:16px; margin:0 0 4px; }
+  p.hint { margin:0 0 12px; color:var(--muted); font-size:12px; }
+  .bar { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+  button { font:inherit; font-size:12px; padding:6px 10px; border:1px solid var(--line); background:#f7f7fb; border-radius:6px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:wait; }
+  ul { list-style:none; margin:0; padding:0; border-top:1px solid var(--line); }
+  li { display:flex; align-items:center; gap:8px; padding:8px 2px; border-bottom:1px solid var(--line); }
+  li .dot { width:10px; height:10px; border-radius:50%; flex:none; }
+  li .name { flex:1; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  li .name:hover { text-decoration:underline; }
+  li .count { color:var(--muted); font-size:12px; }
+  li.off .name { color:var(--muted); text-decoration:line-through; }
+  .switch { position:relative; width:32px; height:18px; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .switch span { position:absolute; inset:0; background:#ccc; border-radius:18px; transition:.15s; cursor:pointer; }
+  .switch span::before { content:""; position:absolute; width:14px; height:14px; left:2px; top:2px; background:#fff; border-radius:50%; transition:.15s; }
+  .switch input:checked + span { background:var(--accent); }
+  .switch input:checked + span::before { transform:translateX(14px); }
+  .opts { margin:12px 0; font-size:12px; color:var(--muted); display:flex; gap:8px; align-items:center; }
+  select { font:inherit; font-size:12px; }
+  #status { margin-top:12px; font-size:12px; color:var(--muted); min-height:1.4em; }
+</style>
+</head>
+<body>
+<div id="panel" hidden>
+  <h1>Focus par tag</h1>
+  <p class="hint">Interrupteur : affiche / estompe les tickets du tag. Clic sur le nom : focus sur ce seul tag.</p>
+  <div class="bar">
+    <button id="all" class="primary">Tout réafficher</button>
+    <button id="none">Tout estomper</button>
+    <button id="refresh">Rafraîchir</button>
+  </div>
+  <div class="opts">
+    Couleur estompée :
+    <select id="dim">
+      <option value="gray">Gris</option>
+      <option value="white">Blanc</option>
+    </select>
+  </div>
+  <ul id="list"></ul>
+  <div id="status"></div>
+</div>
+
+<script>
+const IS_PANEL = new URLSearchParams(location.search).has('panel');
+const META = 'tagToggle';           // { dimmed: bool, orig: string }
+const NONE = '__none__';            // pseudo-tag pour les tickets sans tag
+const CARD_DIM = '#e6e6e6';
+const TAG_COLORS = { red:'#f24726', magenta:'#da0063', violet:'#9510ac', light_green:'#c9df56', green:'#8fd14f',
+  dark_green:'#0ca789', cyan:'#12cdd4', blue:'#2d9bf0', dark_blue:'#414bb2', yellow:'#fac710', gray:'#808080', black:'#1a1a1a' };
+
+if (!IS_PANEL) {
+  // Page "headless" chargée par Miro : ouvre le panneau au clic sur l'icône de l'app
+  miro.board.ui.on('icon:click', async () => {
+    await miro.board.ui.openPanel({ url: 'index.html?panel=1' });
+  });
+} else {
+  document.getElementById('panel').hidden = false;
+  init();
+}
+
+let tags = [], items = [], meta = new Map(), active = new Set(), busy = false;
+const $ = (id) => document.getElementById(id);
+const status = (t) => $('status').textContent = t;
+
+async function batched(list, fn, size = 12) {
+  for (let i = 0; i < list.length; i += size) {
+    await Promise.all(list.slice(i, i + size).map(fn));
+    status(`Mise à jour… ${Math.min(i + size, list.length)}/${list.length}`);
+  }
+}
+
+const tagsOf = (it) => (it.tagIds && it.tagIds.length) ? it.tagIds : [NONE];
+const isDimmed = (it) => !!(meta.get(it.id) || {}).dimmed;
+
+async function load() {
+  status('Lecture du board…');
+  tags = await miro.board.get({ type: 'tag' });
+  items = await miro.board.get({ type: ['sticky_note', 'card'] });
+  meta = new Map();
+  await batched(items, async (it) => { meta.set(it.id, (await it.getMetadata(META)) || {}); }, 25);
+  // Un tag est "actif" si au moins un de ses tickets n'est pas estompé (reprend l'état laissé sur le board)
+  const ids = [...tags.map(t => t.id), NONE];
+  active = new Set(ids.filter(id => {
+    const its = items.filter(it => tagsOf(it).includes(id));
+    return its.length === 0 || its.some(it => !isDimmed(it));
+  }));
+  render();
+  status(`${items.length} tickets, ${tags.length} tags.`);
+}
+
+function render() {
+  const rows = [...tags.map(t => ({ id: t.id, title: t.title, color: TAG_COLORS[t.color] || t.color || '#999' })),
+                { id: NONE, title: '(sans tag)', color: 'transparent' }];
+  $('list').innerHTML = '';
+  for (const r of rows) {
+    const n = items.filter(it => tagsOf(it).includes(r.id)).length;
+    const li = document.createElement('li');
+    if (!active.has(r.id)) li.className = 'off';
+    li.innerHTML = `<label class="switch"><input type="checkbox" ${active.has(r.id) ? 'checked' : ''}><span></span></label>
+      <span class="dot" style="background:${r.color};border:1px solid #ccc"></span>
+      <span class="name" title="Focus sur ce tag"></span><span class="count">${n}</span>`;
+    li.querySelector('.name').textContent = r.title;
+    li.querySelector('input').onchange = (e) => { e.target.checked ? active.add(r.id) : active.delete(r.id); apply(); };
+    li.querySelector('.name').onclick = () => { active = new Set([r.id]); apply(); };
+    $('list').appendChild(li);
+  }
+}
+
+async function apply() {
+  if (busy) return;
+  busy = true; document.querySelectorAll('button').forEach(b => b.disabled = true);
+  render();
+  const dim = $('dim').value;
+  const shouldShow = (it) => tagsOf(it).some(id => active.has(id));
+  const toDim = items.filter(it => !shouldShow(it) && !isDimmed(it));
+  const toShow = items.filter(it => shouldShow(it) && isDimmed(it));
+  try {
+    await batched([...toDim, ...toShow], async (it) => {
+      const m = meta.get(it.id) || {};
+      if (!m.dimmed) {
+        const orig = it.type === 'card' ? it.style.cardTheme : it.style.fillColor;
+        const next = { dimmed: true, orig };
+        await it.setMetadata(META, next);           // on mémorise d'abord la couleur d'origine
+        if (it.type === 'card') it.style.cardTheme = CARD_DIM; else it.style.fillColor = dim;
+        await it.sync();
+        meta.set(it.id, next);
+      } else {
+        if (it.type === 'card') it.style.cardTheme = m.orig; else it.style.fillColor = m.orig;
+        await it.sync();
+        await it.setMetadata(META, { dimmed: false });
+        meta.set(it.id, { dimmed: false });
+      }
+    });
+    status(`OK : ${toDim.length} estompé(s), ${toShow.length} réaffiché(s).`);
+  } catch (e) {
+    console.error(e); status('Erreur : ' + (e.message || e));
+  } finally {
+    busy = false; document.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+async function init() {
+  $('all').onclick = () => { active = new Set([...tags.map(t => t.id), NONE]); apply(); };
+  $('none').onclick = () => { active = new Set(); apply(); };
+  $('refresh').onclick = load;
+  try { await load(); } catch (e) { console.error(e); status('Erreur : ' + (e.message || e)); }
+}
+</script>
+</body>
+</html>
