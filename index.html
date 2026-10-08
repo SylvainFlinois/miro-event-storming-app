@@ -31,6 +31,7 @@
   .opts { margin:8px 0; font-size:12px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .opts label { display:flex; gap:4px; align-items:center; }
   select, input[type=range] { font:inherit; font-size:12px; }
+  h2 { font-size:14px; margin:20px 0 4px; }
   #status { margin-top:12px; font-size:12px; color:var(--muted); min-height:1.4em; }
 </style>
 </head>
@@ -55,6 +56,14 @@
     <select id="dim"><option value="gray">Gris</option><option value="white">Blanc</option></select>
   </div>
   <ul id="list"></ul>
+
+  <h2>Frames</h2>
+  <p class="hint">Interrupteur : affiche / cache le contenu de la frame. Clic sur le nom : zoom sur la frame.</p>
+  <div class="bar">
+    <button id="fOpen">Tout déplier</button>
+    <button id="fClose">Tout replier</button>
+  </div>
+  <ul id="frames"></ul>
   <div id="status"></div>
 </div>
 
@@ -69,7 +78,7 @@ const MARGIN = 2000;                // le voile déborde de la zone utilisée
 const TAG_COLORS = { red:'#f24726', magenta:'#da0063', violet:'#9510ac', light_green:'#c9df56', green:'#8fd14f',
   dark_green:'#0ca789', cyan:'#12cdd4', blue:'#2d9bf0', dark_blue:'#414bb2', yellow:'#fac710', gray:'#808080', black:'#1a1a1a' };
 
-let tags = [], items = [], allItems = [], dimmed = {}, veil = null, active = new Set(), busy = false;
+let frames = [], tags = [], items = [], allItems = [], dimmed = {}, veil = null, active = new Set(), busy = false;
 const $ = (id) => document.getElementById(id);
 const status = (t) => $('status').textContent = t;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -112,6 +121,9 @@ async function load() {
   tags = await withRetry(() => miro.board.get({ type: 'tag' }));
   allItems = await withRetry(() => miro.board.get());
   items = allItems.filter(it => it.type === 'sticky_note' || it.type === 'card');
+  // Frames triées dans l'ordre de lecture (haut → bas, gauche → droite)
+  frames = allItems.filter(it => it.type === 'frame')
+    .sort((a, b) => (Math.abs(a.y - b.y) > 200 ? a.y - b.y : a.x - b.x));
   dimmed = (await withRetry(() => miro.board.getAppData(APPDATA))) || {};
   const ids = new Set(items.map(it => it.id));
   for (const id of Object.keys(dimmed)) if (!ids.has(id)) delete dimmed[id];
@@ -136,7 +148,8 @@ async function load() {
     return its.length === 0 || its.some(it => !isDimmed(it));
   }));
   render();
-  status(`${items.length} tickets, ${tags.length} tags${veil ? ' — voile actif' : ''}.`);
+  renderFrames();
+  status(`${items.length} tickets, ${tags.length} tags, ${frames.length} frames${veil ? ' — voile actif' : ''}.`);
 }
 
 function render() {
@@ -225,6 +238,41 @@ async function restoreColors() {
   if (list.length) await saveDimmed();
 }
 
+// ---------- Frames : afficher / cacher le contenu ----------
+const isOpen = (f) => f.showContent !== false;
+
+function renderFrames() {
+  $('frames').innerHTML = '';
+  if (!frames.length) { $('frames').innerHTML = '<li class="count">Aucune frame sur ce board.</li>'; return; }
+  for (const f of frames) {
+    const n = allItems.filter(it => it.parentId === f.id).length;
+    const li = document.createElement('li');
+    if (!isOpen(f)) li.className = 'off';
+    li.innerHTML = `<label class="switch"><input type="checkbox" ${isOpen(f) ? 'checked' : ''}><span></span></label>
+      <span class="name" title="Zoomer sur la frame"></span><span class="count">${n}</span>`;
+    li.querySelector('.name').textContent = (f.title || '').replace(/<[^>]+>/g, '').trim() || '(frame sans titre)';
+    li.querySelector('input').onchange = (e) => setFrames([f], e.target.checked);
+    li.querySelector('.name').onclick = () => miro.board.viewport.zoomTo(f).catch(console.warn);
+    $('frames').appendChild(li);
+  }
+}
+
+async function setFrames(list, open) {
+  if (busy) return;
+  const todo = list.filter(f => isOpen(f) !== open);
+  if (!todo.length) { renderFrames(); return; }
+  busy = true; document.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    await batched(todo, async (f) => { f.showContent = open; await f.sync(); });
+    status(`OK : ${todo.length} frame(s) ${open ? 'dépliée(s)' : 'repliée(s)'}.`);
+  } catch (e) {
+    console.error(e); status('Erreur frames : ' + (e.message || e));
+  } finally {
+    busy = false; document.querySelectorAll('button').forEach(b => b.disabled = false);
+    renderFrames();
+  }
+}
+
 // ---------- Orchestration ----------
 async function apply() {
   if (busy) return;
@@ -251,6 +299,8 @@ function syncModeUI() {
 async function init() {
   $('all').onclick = () => { active = new Set(allIds()); apply(); };
   $('none').onclick = () => { active = new Set(); apply(); };
+  $('fOpen').onclick = () => setFrames(frames, true);
+  $('fClose').onclick = () => setFrames(frames, false);
   $('refresh').onclick = () => load().catch(e => status('Erreur : ' + (e.message || e)));
   document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => { syncModeUI(); apply(); });
   $('opacity').oninput = () => { $('opv').textContent = Math.round($('opacity').value * 100) + ' %'; };
