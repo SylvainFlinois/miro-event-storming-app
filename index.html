@@ -44,16 +44,8 @@
     <button id="none">Tout estomper</button>
     <button id="refresh">Rafraîchir</button>
   </div>
-  <div class="opts">
-    <label><input type="radio" name="mode" value="veil" checked> Voile</label>
-    <label><input type="radio" name="mode" value="color"> Recolorer</label>
-  </div>
   <div class="opts" id="veilOpts">
     Opacité du voile : <input type="range" id="opacity" min="0.5" max="0.95" step="0.05" value="0.8"> <span id="opv">80 %</span>
-  </div>
-  <div class="opts" id="colorOpts" hidden>
-    Couleur estompée :
-    <select id="dim"><option value="gray">Gris</option><option value="white">Blanc</option></select>
   </div>
   <ul id="list"></ul>
 
@@ -87,7 +79,7 @@ let frames = [], tags = [], items = [], allItems = [], dimmed = {}, veils = [], 
 const $ = (id) => document.getElementById(id);
 const status = (t) => $('status').textContent = t;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const mode = () => document.querySelector('input[name=mode]:checked').value;
+const DIM_COLOR = 'gray';           // couleur des rares post-its hors frame estompés
 
 async function withRetry(fn) {
   for (let attempt = 0; ; attempt++) {
@@ -244,7 +236,7 @@ async function applyVeil() {
 
 // ---------- Mode Recolorer ----------
 async function applyColor(scope = items) {
-  const dim = $('dim').value;
+  const dim = DIM_COLOR;
   const toDim = scope.filter(it => !shouldShow(it) && !isDimmed(it));
   const toShow = scope.filter(it => shouldShow(it) && isDimmed(it));
   if (toDim.length) { for (const it of toDim) dimmed[it.id] = colorOf(it); await saveDimmed(); }
@@ -403,8 +395,7 @@ async function apply() {
     frames = allItems.filter(it => it.type === 'frame');
     veils = veils.map(v => allItems.find(it => it.id === v.id)).filter(Boolean);
     let msg;
-    if (mode() === 'veil') { msg = await applyVeil(); }
-    else { await removeVeil(); msg = await applyColor(); }
+    msg = await applyVeil();
     status('OK : ' + msg + '.');
   } catch (e) {
     console.error(e); status('Erreur : ' + (e.message || e));
@@ -414,21 +405,14 @@ async function apply() {
   }
 }
 
-function syncModeUI() {
-  $('veilOpts').hidden = mode() !== 'veil';
-  $('colorOpts').hidden = mode() !== 'color';
-}
-
 async function init() {
   $('all').onclick = () => { active = new Set(allIds()); apply(); };
   $('none').onclick = () => { active = new Set(); apply(); };
   $('fMark').onclick = () => markSelected().then(status).catch(e => status('Erreur : ' + (e.message || e)));
   $('fOpenAll').onclick = () => expandAll().then(status).catch(e => status('Erreur : ' + (e.message || e)));
   $('refresh').onclick = () => load().catch(e => status('Erreur : ' + (e.message || e)));
-  document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => { syncModeUI(); apply(); });
   $('opacity').oninput = () => { $('opv').textContent = Math.round($('opacity').value * 100) + ' %'; };
   $('opacity').onchange = () => { if (veils.length) apply(); };
-  syncModeUI();
   miro.board.ui.on('selection:update', (ev) => onSelection(ev).catch(e => status('Erreur bouton : ' + (e.message || e))));
   try { await load(); } catch (e) { console.error(e); status('Erreur : ' + (e.message || e)); }
 }
