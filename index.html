@@ -184,31 +184,30 @@ function boardBounds() {
   return { x: (x0 + x1) / 2, y: (y0 + y1) / 2, width: x1 - x0 + 2 * MARGIN, height: y1 - y0 + 2 * MARGIN };
 }
 
-async function removeVeil() {
-  if (!veil) { await framesToBack(); return; }
-  try { await withRetry(() => miro.board.remove(veil)); } catch (e) { console.warn(e); }
-  veil = null;
-  await withRetry(() => miro.board.setAppData(VEIL_KEY, null));
-  await framesToBack();
-}
+// NB : Miro interdit de changer l'ordre des frames (elles restent toujours au fond), et un post-it
+// envoyé "tout au fond" passe sous le fond de sa frame. On ne fait donc jamais sendToBack sur les
+// post-its : on remonte le voile, puis on remonte par-dessus tout ce qui doit rester visible.
+// Ordre obtenu : frames < post-its estompés < voile < tout le reste.
+const NOT_REORDERABLE = ['frame', 'connector'];
 
-// Les frames repassent tout au fond, derrière leurs post-its (sinon les post-its envoyés
-// en arrière se retrouvent sous le fond de la frame et deviennent difficiles à sélectionner).
-async function framesToBack() {
-  if (frames.length) await sendBack(frames);
-}
-
-async function sendBack(list) {
+async function bringFront(list) {
   if (!list.length) return;
-  try { await withRetry(() => miro.board.sendToBack(list)); }         // 1 appel pour toute la liste
+  try { await withRetry(() => miro.board.bringToFront(list)); }       // 1 appel pour toute la liste
   catch (e) {                                                         // repli si la liste est refusée
-    console.warn('sendToBack(liste) refusé, repli par lots', e);
-    await batched(list, (it) => miro.board.sendToBack(it));
+    console.warn('bringToFront(liste) refusé, repli par lots', e);
+    await batched(list, (it) => miro.board.bringToFront(it));
   }
 }
 
-// Le voile est placé le plus en arrière possible : seuls les tickets estompés passent derrière lui.
-// Tout le reste (tickets sans tag, tags allumés, flèches, textes…) reste devant.
+async function removeVeil() {
+  if (veil) {
+    try { await withRetry(() => miro.board.remove(veil)); } catch (e) { console.warn(e); }
+    veil = null;
+    await withRetry(() => miro.board.setAppData(VEIL_KEY, null));
+  }
+  await bringFront(items);              // remet les post-its devant leur frame (corrige les anciennes versions)
+}
+
 async function applyVeil() {
   const hidden = items.filter(it => !shouldShow(it));
   if (!hidden.length) { await removeVeil(); return 'voile retiré'; }
@@ -222,9 +221,12 @@ async function applyVeil() {
   } else if (veil.style.fillOpacity !== opacity) {
     veil.style.fillOpacity = opacity; await withRetry(() => veil.sync());
   }
-  await withRetry(() => miro.board.sendToBack(veil));   // voile tout au fond (les anciens estompés repassent devant)
-  await sendBack(hidden);                               // puis les estompés actuels passent derrière le voile
-  await framesToBack();                                 // enfin les frames tout au fond : frames < estompés < voile < reste
+  const hiddenIds = new Set(hidden.map(it => it.id));
+  // estompés devant leur frame (au cas où ils seraient passés dessous), puis voile, puis le reste
+  await bringFront(hidden);
+  await withRetry(() => miro.board.bringToFront(veil));
+  const visible = allItems.filter(it => it.id !== veil.id && !hiddenIds.has(it.id) && !NOT_REORDERABLE.includes(it.type));
+  await bringFront(visible);
   return `${hidden.length} ticket(s) estompé(s)`;
 }
 
