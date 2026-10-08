@@ -400,7 +400,7 @@ async function init() {
 if (!IS_PANEL) {
   // Contexte "arrière-plan" : chargé par Miro à l'ouverture du board
   miro.board.ui.on('icon:click', async () => {
-    await miro.board.ui.openPanel({ url: 'index.html?panel=1' });
+    await miro.board.ui.openPanel({ url: 'index.html?panel=1&v=' + Date.now() });  // évite le cache navigateur
   });
   miro.board.ui.on('selection:update', (ev) => onSelection(ev).catch(console.error));
   registerFrameAction();
