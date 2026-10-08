@@ -37,7 +37,7 @@
 <body>
 <div id="panel" hidden>
   <h1>Focus par tag</h1>
-  <p class="hint">Interrupteur : affiche / estompe les tickets du tag. Clic sur le nom : focus sur ce seul tag.</p>
+  <p class="hint">Interrupteur : affiche / estompe les tickets du tag. Clic sur le nom : focus sur ce seul tag. Les tickets sans tag ne sont jamais estompés.</p>
   <div class="bar">
     <button id="all" class="primary">Tout réafficher</button>
     <button id="none">Tout estomper</button>
@@ -63,7 +63,6 @@ const IS_PANEL = new URLSearchParams(location.search).has('panel');
 const META = 'tagToggle';           // v1 : métadonnées par ticket (lu seulement pour migration)
 const APPDATA = 'dimmed';           // mode Recolorer : { [itemId]: couleurOrigine }
 const VEIL_KEY = 'veil';            // mode Voile : id du rectangle-voile
-const NONE = '__none__';
 const CARD_DIM = '#e6e6e6';
 const DIM_COLORS = ['gray', 'white'];
 const MARGIN = 2000;                // le voile déborde de la zone utilisée
@@ -98,13 +97,14 @@ async function batched(list, fn, size = 8, pause = 150) {
   }
 }
 
-const tagsOf = (it) => (it.tagIds && it.tagIds.length) ? it.tagIds : [NONE];
+const tagsOf = (it) => it.tagIds || [];
 const isDimmed = (it) => it.id in dimmed;
 const colorOf = (it) => it.type === 'card' ? it.style.cardTheme : it.style.fillColor;
 const setColor = (it, c) => { if (it.type === 'card') it.style.cardTheme = c; else it.style.fillColor = c; };
 const saveDimmed = () => withRetry(() => miro.board.setAppData(APPDATA, dimmed));
-const shouldShow = (it) => tagsOf(it).some(id => active.has(id));
-const allIds = () => [...tags.map(t => t.id), NONE];
+// Sans tag => toujours visible ; sinon visible si au moins un de ses tags est allumé
+const shouldShow = (it) => tagsOf(it).length === 0 || tagsOf(it).some(id => active.has(id));
+const allIds = () => tags.map(t => t.id);
 
 // ---------- Chargement ----------
 async function load() {
@@ -140,8 +140,7 @@ async function load() {
 }
 
 function render() {
-  const rows = [...tags.map(t => ({ id: t.id, title: t.title, color: TAG_COLORS[t.color] || t.color || '#999' })),
-                { id: NONE, title: '(sans tag)', color: 'transparent' }];
+  const rows = [...tags.map(t => ({ id: t.id, title: t.title, color: TAG_COLORS[t.color] || t.color || '#999' }))];
   $('list').innerHTML = '';
   for (const r of rows) {
     const n = items.filter(it => tagsOf(it).includes(r.id)).length;
@@ -179,18 +178,20 @@ async function removeVeil() {
   await withRetry(() => miro.board.setAppData(VEIL_KEY, null));
 }
 
-async function bringFront(list) {
+async function sendBack(list) {
   if (!list.length) return;
-  try { await withRetry(() => miro.board.bringToFront(list)); }       // 1 appel pour toute la liste
+  try { await withRetry(() => miro.board.sendToBack(list)); }         // 1 appel pour toute la liste
   catch (e) {                                                         // repli si la liste est refusée
-    console.warn('bringToFront(liste) refusé, repli par lots', e);
-    await batched(list, (it) => miro.board.bringToFront(it));
+    console.warn('sendToBack(liste) refusé, repli par lots', e);
+    await batched(list, (it) => miro.board.sendToBack(it));
   }
 }
 
+// Le voile est placé le plus en arrière possible : seuls les tickets estompés passent derrière lui.
+// Tout le reste (tickets sans tag, tags allumés, flèches, textes…) reste devant.
 async function applyVeil() {
-  const shown = items.filter(shouldShow);
-  if (shown.length === items.length) { await removeVeil(); return 'voile retiré'; }
+  const hidden = items.filter(it => !shouldShow(it));
+  if (!hidden.length) { await removeVeil(); return 'voile retiré'; }
   const opacity = parseFloat($('opacity').value);
   if (!veil) {
     veil = await withRetry(() => miro.board.createShape({
@@ -198,12 +199,12 @@ async function applyVeil() {
       style: { fillColor: '#ffffff', fillOpacity: opacity, borderOpacity: 0, borderWidth: 1 },
     }));
     await withRetry(() => miro.board.setAppData(VEIL_KEY, veil.id));
-  } else {
-    if (veil.style.fillOpacity !== opacity) { veil.style.fillOpacity = opacity; await withRetry(() => veil.sync()); }
-    await withRetry(() => miro.board.bringToFront(veil));            // repasse devant les anciens tickets mis en avant
+  } else if (veil.style.fillOpacity !== opacity) {
+    veil.style.fillOpacity = opacity; await withRetry(() => veil.sync());
   }
-  await bringFront(shown);
-  return `${shown.length} ticket(s) mis en avant`;
+  await withRetry(() => miro.board.sendToBack(veil));   // voile tout au fond (les anciens estompés repassent devant)
+  await sendBack(hidden);                               // puis les estompés actuels passent derrière le voile
+  return `${hidden.length} ticket(s) estompé(s)`;
 }
 
 // ---------- Mode Recolorer ----------
