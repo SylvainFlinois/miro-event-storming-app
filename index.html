@@ -57,13 +57,13 @@
   </div>
   <ul id="list"></ul>
 
-  <h2>Frames</h2>
-  <p class="hint">Interrupteur : affiche / cache le contenu de la frame. Clic sur le nom : zoom sur la frame.</p>
+  <h2>Frames repliables</h2>
+  <p class="hint">Sélectionne une frame, puis « … » → « Rendre repliable » (ou le bouton ci-dessous).
+  Un bouton « ▾ Replier » apparaît au-dessus de la frame : clique dessus pour replier / déplier.</p>
   <div class="bar">
-    <button id="fOpen">Tout déplier</button>
-    <button id="fClose">Tout replier</button>
+    <button id="fMark">Rendre la frame sélectionnée repliable / non repliable</button>
+    <button id="fOpenAll">Tout déplier</button>
   </div>
-  <ul id="frames"></ul>
   <div id="status"></div>
 </div>
 
@@ -74,6 +74,8 @@ const APPDATA = 'dimmed';           // mode Recolorer : { [itemId]: couleurOrigi
 const VEIL_KEY = 'veil';            // mode Voile : id du rectangle-voile
 const CARD_DIM = '#e6e6e6';
 const DIM_COLORS = ['gray', 'white'];
+const COLL_KEY = 'collapsible';     // { [frameId]: { btn, collapsed, x, y } }
+const PARK_DX = 100000;             // décalage de la zone de rangement des frames repliées
 const MARGIN = 2000;                // le voile déborde de la zone utilisée
 const TAG_COLORS = { red:'#f24726', magenta:'#da0063', violet:'#9510ac', light_green:'#c9df56', green:'#8fd14f',
   dark_green:'#0ca789', cyan:'#12cdd4', blue:'#2d9bf0', dark_blue:'#414bb2', yellow:'#fac710', gray:'#808080', black:'#1a1a1a' };
@@ -121,9 +123,7 @@ async function load() {
   tags = await withRetry(() => miro.board.get({ type: 'tag' }));
   allItems = await withRetry(() => miro.board.get());
   items = allItems.filter(it => it.type === 'sticky_note' || it.type === 'card');
-  // Frames triées dans l'ordre de lecture (haut → bas, gauche → droite)
-  frames = allItems.filter(it => it.type === 'frame')
-    .sort((a, b) => (Math.abs(a.y - b.y) > 200 ? a.y - b.y : a.x - b.x));
+  frames = allItems.filter(it => it.type === 'frame');
   dimmed = (await withRetry(() => miro.board.getAppData(APPDATA))) || {};
   const ids = new Set(items.map(it => it.id));
   for (const id of Object.keys(dimmed)) if (!ids.has(id)) delete dimmed[id];
@@ -148,7 +148,6 @@ async function load() {
     return its.length === 0 || its.some(it => !isDimmed(it));
   }));
   render();
-  renderFrames();
   status(`${items.length} tickets, ${tags.length} tags, ${frames.length} frames${veil ? ' — voile actif' : ''}.`);
 }
 
@@ -175,6 +174,7 @@ function boardBounds() {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const it of allItems) {
     if (it.parentId || it.id === (veil && veil.id)) continue;
+    if (Math.abs(it.x) > PARK_DX / 2) continue;           // frames repliées (zone de rangement)
     if (typeof it.x !== 'number' || typeof it.width !== 'number') continue;
     const h = it.height || it.width;
     x0 = Math.min(x0, it.x - it.width / 2); x1 = Math.max(x1, it.x + it.width / 2);
@@ -238,39 +238,116 @@ async function restoreColors() {
   if (list.length) await saveDimmed();
 }
 
-// ---------- Frames : afficher / cacher le contenu ----------
-const isOpen = (f) => f.showContent !== false;
+// ---------- Frames repliables ----------
+// Replier  = déplacer la frame (son contenu suit) dans une zone de rangement lointaine,
+//            et transformer le bouton en bandeau « ▸ titre — replié » à l'emplacement d'origine.
+// Déplier  = ramener la frame à sa position exacte, et remettre le bouton au-dessus.
+// Le bouton est une forme du board : quand quelqu'un la sélectionne, l'app (chargée en
+// arrière-plan à l'ouverture du board) replie / déplie la frame correspondante.
+const getColl = async () => (await withRetry(() => miro.board.getAppData(COLL_KEY))) || {};
+const setColl = (c) => withRetry(() => miro.board.setAppData(COLL_KEY, c));
+const plainTitle = (f) => (f.title || '').replace(/<[^>]+>/g, '').trim() || 'Frame';
+const BTN_OPEN = { w: 260, h: 70 };
+const toggling = new Set();
 
-function renderFrames() {
-  $('frames').innerHTML = '';
-  if (!frames.length) { $('frames').innerHTML = '<li class="count">Aucune frame sur ce board.</li>'; return; }
-  for (const f of frames) {
-    const n = allItems.filter(it => it.parentId === f.id).length;
-    const li = document.createElement('li');
-    if (!isOpen(f)) li.className = 'off';
-    li.innerHTML = `<label class="switch"><input type="checkbox" ${isOpen(f) ? 'checked' : ''}><span></span></label>
-      <span class="name" title="Zoomer sur la frame"></span><span class="count">${n}</span>`;
-    li.querySelector('.name').textContent = (f.title || '').replace(/<[^>]+>/g, '').trim() || '(frame sans titre)';
-    li.querySelector('input').onchange = (e) => setFrames([f], e.target.checked);
-    li.querySelector('.name').onclick = () => miro.board.viewport.zoomTo(f).catch(console.warn);
-    $('frames').appendChild(li);
-  }
+function openBtnPos(f) {             // au-dessus du coin haut-droit de la frame
+  return { x: f.x + f.width / 2 - BTN_OPEN.w / 2, y: f.y - f.height / 2 - BTN_OPEN.h / 2 - 20,
+           width: BTN_OPEN.w, height: BTN_OPEN.h };
+}
+function styleOpen(btn, f) {
+  Object.assign(btn, openBtnPos(f));
+  btn.content = '<p>▾ Replier</p>';
+  Object.assign(btn.style, { fillColor: '#4262ff', color: '#ffffff', fontSize: 28, borderOpacity: 0,
+                             textAlign: 'center', textAlignVertical: 'middle', fillOpacity: 1 });
+}
+function styleClosed(btn, f, x, y) { // bandeau à l'emplacement du haut de la frame d'origine
+  const w = Math.min(Math.max(f.width, 600), 2400), h = 140;
+  Object.assign(btn, { x: x - f.width / 2 + w / 2, y: y - f.height / 2 + h / 2, width: w, height: h });
+  btn.content = `<p>▸ ${plainTitle(f).replace(/[<>&]/g, '')} — replié</p>`;
+  Object.assign(btn.style, { fillColor: '#e7e9f7', color: '#1a1a2e', fontSize: 40, borderOpacity: 1,
+                             borderColor: '#4262ff', textAlign: 'left', textAlignVertical: 'middle', fillOpacity: 1 });
 }
 
-async function setFrames(list, open) {
-  if (busy) return;
-  const todo = list.filter(f => isOpen(f) !== open);
-  if (!todo.length) { renderFrames(); return; }
-  busy = true; document.querySelectorAll('button').forEach(b => b.disabled = true);
-  try {
-    await batched(todo, async (f) => { f.showContent = open; await f.sync(); });
-    status(`OK : ${todo.length} frame(s) ${open ? 'dépliée(s)' : 'repliée(s)'}.`);
-  } catch (e) {
-    console.error(e); status('Erreur frames : ' + (e.message || e));
-  } finally {
-    busy = false; document.querySelectorAll('button').forEach(b => b.disabled = false);
-    renderFrames();
+async function markFrame(f) {
+  const coll = await getColl();
+  if (coll[f.id]) {                    // déjà repliable -> on retire
+    if (coll[f.id].collapsed) await toggleFrame(f.id);
+    const c = await getColl();
+    try { await miro.board.remove(await miro.board.getById(c[f.id].btn)); } catch (_) {}
+    delete c[f.id]; await setColl(c);
+    return `« ${plainTitle(f)} » n'est plus repliable.`;
   }
+  const btn = await withRetry(() => miro.board.createShape({ shape: 'round_rectangle', content: '', ...openBtnPos(f) }));
+  styleOpen(btn, f); await withRetry(() => btn.sync());
+  coll[f.id] = { btn: btn.id, collapsed: false };
+  await setColl(coll);
+  return `« ${plainTitle(f)} » est maintenant repliable.`;
+}
+
+async function toggleFrame(frameId) {
+  if (toggling.has(frameId)) return;
+  toggling.add(frameId);
+  try {
+    const coll = await getColl();
+    const e = coll[frameId]; if (!e) return;
+    const [f, btn] = await Promise.all([miro.board.getById(frameId), miro.board.getById(e.btn)]);
+    if (!e.collapsed) {
+      e.x = f.x; e.y = f.y; e.collapsed = true;
+      await setColl(coll);             // mémoriser la position avant de bouger
+      f.x = e.x + PARK_DX; await withRetry(() => f.sync());
+      styleClosed(btn, f, e.x, e.y); await withRetry(() => btn.sync());
+    } else {
+      f.x = e.x; f.y = e.y; await withRetry(() => f.sync());
+      styleOpen(btn, f); await withRetry(() => btn.sync());
+      e.collapsed = false; delete e.x; delete e.y;
+      await setColl(coll);
+    }
+  } finally { toggling.delete(frameId); }
+}
+
+async function expandAll() {
+  const coll = await getColl();
+  const ids = Object.keys(coll).filter(id => coll[id].collapsed);
+  for (const id of ids) await toggleFrame(id);
+  return `${ids.length} frame(s) dépliée(s).`;
+}
+
+// Clic (sélection) sur un bouton -> replier / déplier
+async function onSelection(ev) {
+  const sel = ev.items || [];
+  if (sel.length !== 1 || sel[0].type !== 'shape') return;
+  const coll = await getColl();
+  const frameId = Object.keys(coll).find(id => coll[id].btn === sel[0].id);
+  if (!frameId) return;
+  try { await miro.board.deselect(); } catch (_) {}
+  await toggleFrame(frameId);
+}
+
+// Entrée « Rendre repliable » dans le menu « … » d'une frame (API expérimentale de Miro)
+async function registerFrameAction() {
+  try {
+    await miro.board.experimental.action.register({
+      event: 'toggle-collapsible',
+      ui: { label: { en: 'Rendre repliable / non repliable' }, icon: 'frame',
+            description: 'Ajoute un bouton pour replier / déplier cette frame' },
+      scope: 'local',
+      predicate: { type: 'frame' },
+      contexts: { item: {} },
+    });
+    miro.board.ui.on('custom:toggle-collapsible', async (ev) => {
+      for (const f of (ev.items || []).filter(i => i.type === 'frame')) {
+        const msg = await markFrame(f);
+        try { await miro.board.notifications.showInfo(msg); } catch (_) {}
+      }
+    });
+  } catch (e) { console.warn('Action personnalisée indisponible', e); }
+}
+
+async function markSelected() {
+  const sel = (await miro.board.getSelection()).filter(i => i.type === 'frame');
+  if (!sel.length) return 'Sélectionne d\'abord une frame sur le board.';
+  const msgs = []; for (const f of sel) msgs.push(await markFrame(f));
+  return msgs.join(' ');
 }
 
 // ---------- Orchestration ----------
@@ -299,8 +376,8 @@ function syncModeUI() {
 async function init() {
   $('all').onclick = () => { active = new Set(allIds()); apply(); };
   $('none').onclick = () => { active = new Set(); apply(); };
-  $('fOpen').onclick = () => setFrames(frames, true);
-  $('fClose').onclick = () => setFrames(frames, false);
+  $('fMark').onclick = () => markSelected().then(status).catch(e => status('Erreur : ' + (e.message || e)));
+  $('fOpenAll').onclick = () => expandAll().then(status).catch(e => status('Erreur : ' + (e.message || e)));
   $('refresh').onclick = () => load().catch(e => status('Erreur : ' + (e.message || e)));
   document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => { syncModeUI(); apply(); });
   $('opacity').oninput = () => { $('opv').textContent = Math.round($('opacity').value * 100) + ' %'; };
@@ -311,9 +388,12 @@ async function init() {
 
 // Démarrage : APRÈS toutes les déclarations
 if (!IS_PANEL) {
+  // Contexte "arrière-plan" : chargé par Miro à l'ouverture du board
   miro.board.ui.on('icon:click', async () => {
     await miro.board.ui.openPanel({ url: 'index.html?panel=1' });
   });
+  miro.board.ui.on('selection:update', (ev) => onSelection(ev).catch(console.error));
+  registerFrameAction();
 } else {
   $('panel').hidden = false;
   init();
