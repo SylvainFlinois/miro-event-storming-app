@@ -28,8 +28,9 @@
   .switch span::before { content:""; position:absolute; width:14px; height:14px; left:2px; top:2px; background:#fff; border-radius:50%; transition:.15s; }
   .switch input:checked + span { background:var(--accent); }
   .switch input:checked + span::before { transform:translateX(14px); }
-  .opts { margin:12px 0; font-size:12px; color:var(--muted); display:flex; gap:8px; align-items:center; }
-  select { font:inherit; font-size:12px; }
+  .opts { margin:8px 0; font-size:12px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .opts label { display:flex; gap:4px; align-items:center; }
+  select, input[type=range] { font:inherit; font-size:12px; }
   #status { margin-top:12px; font-size:12px; color:var(--muted); min-height:1.4em; }
 </style>
 </head>
@@ -43,11 +44,15 @@
     <button id="refresh">Rafraîchir</button>
   </div>
   <div class="opts">
+    <label><input type="radio" name="mode" value="veil" checked> Voile</label>
+    <label><input type="radio" name="mode" value="color"> Recolorer</label>
+  </div>
+  <div class="opts" id="veilOpts">
+    Opacité du voile : <input type="range" id="opacity" min="0.5" max="0.95" step="0.05" value="0.8"> <span id="opv">80 %</span>
+  </div>
+  <div class="opts" id="colorOpts" hidden>
     Couleur estompée :
-    <select id="dim">
-      <option value="gray">Gris</option>
-      <option value="white">Blanc</option>
-    </select>
+    <select id="dim"><option value="gray">Gris</option><option value="white">Blanc</option></select>
   </div>
   <ul id="list"></ul>
   <div id="status"></div>
@@ -55,40 +60,83 @@
 
 <script>
 const IS_PANEL = new URLSearchParams(location.search).has('panel');
-const META = 'tagToggle';           // { dimmed: bool, orig: string }
-const NONE = '__none__';            // pseudo-tag pour les tickets sans tag
+const META = 'tagToggle';           // v1 : métadonnées par ticket (lu seulement pour migration)
+const APPDATA = 'dimmed';           // mode Recolorer : { [itemId]: couleurOrigine }
+const VEIL_KEY = 'veil';            // mode Voile : id du rectangle-voile
+const NONE = '__none__';
 const CARD_DIM = '#e6e6e6';
+const DIM_COLORS = ['gray', 'white'];
+const MARGIN = 2000;                // le voile déborde de la zone utilisée
 const TAG_COLORS = { red:'#f24726', magenta:'#da0063', violet:'#9510ac', light_green:'#c9df56', green:'#8fd14f',
   dark_green:'#0ca789', cyan:'#12cdd4', blue:'#2d9bf0', dark_blue:'#414bb2', yellow:'#fac710', gray:'#808080', black:'#1a1a1a' };
 
-let tags = [], items = [], meta = new Map(), active = new Set(), busy = false;
+let tags = [], items = [], allItems = [], dimmed = {}, veil = null, active = new Set(), busy = false;
 const $ = (id) => document.getElementById(id);
 const status = (t) => $('status').textContent = t;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const mode = () => document.querySelector('input[name=mode]:checked').value;
 
-async function batched(list, fn, size = 12) {
+async function withRetry(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); }
+    catch (e) {
+      const msg = String((e && e.message) || e);
+      if (attempt < 8 && /rate.?limit|too many/i.test(msg)) {
+        const wait = Math.min(1000 * 2 ** attempt, 20000);
+        status(`Limite Miro atteinte, pause ${Math.round(wait / 1000)} s…`);
+        await sleep(wait);
+      } else throw e;
+    }
+  }
+}
+
+async function batched(list, fn, size = 8, pause = 150) {
   for (let i = 0; i < list.length; i += size) {
-    await Promise.all(list.slice(i, i + size).map(fn));
+    await Promise.all(list.slice(i, i + size).map(it => withRetry(() => fn(it))));
     status(`Mise à jour… ${Math.min(i + size, list.length)}/${list.length}`);
+    if (i + size < list.length) await sleep(pause);
   }
 }
 
 const tagsOf = (it) => (it.tagIds && it.tagIds.length) ? it.tagIds : [NONE];
-const isDimmed = (it) => !!(meta.get(it.id) || {}).dimmed;
+const isDimmed = (it) => it.id in dimmed;
+const colorOf = (it) => it.type === 'card' ? it.style.cardTheme : it.style.fillColor;
+const setColor = (it, c) => { if (it.type === 'card') it.style.cardTheme = c; else it.style.fillColor = c; };
+const saveDimmed = () => withRetry(() => miro.board.setAppData(APPDATA, dimmed));
+const shouldShow = (it) => tagsOf(it).some(id => active.has(id));
+const allIds = () => [...tags.map(t => t.id), NONE];
 
+// ---------- Chargement ----------
 async function load() {
   status('Lecture du board…');
-  tags = await miro.board.get({ type: 'tag' });
-  items = await miro.board.get({ type: ['sticky_note', 'card'] });
-  meta = new Map();
-  await batched(items, async (it) => { meta.set(it.id, (await it.getMetadata(META)) || {}); }, 25);
-  // Un tag est "actif" si au moins un de ses tickets n'est pas estompé (reprend l'état laissé sur le board)
-  const ids = [...tags.map(t => t.id), NONE];
-  active = new Set(ids.filter(id => {
+  tags = await withRetry(() => miro.board.get({ type: 'tag' }));
+  allItems = await withRetry(() => miro.board.get());
+  items = allItems.filter(it => it.type === 'sticky_note' || it.type === 'card');
+  dimmed = (await withRetry(() => miro.board.getAppData(APPDATA))) || {};
+  const ids = new Set(items.map(it => it.id));
+  for (const id of Object.keys(dimmed)) if (!ids.has(id)) delete dimmed[id];
+
+  // Voile existant ?
+  const veilId = await withRetry(() => miro.board.getAppData(VEIL_KEY));
+  veil = veilId ? allItems.find(it => it.id === veilId) || null : null;
+
+  // Migration v1 (métadonnées par ticket)
+  const suspects = items.filter(it => !isDimmed(it) &&
+    (it.type === 'card' ? colorOf(it) === CARD_DIM : DIM_COLORS.includes(colorOf(it))));
+  let migrated = 0;
+  await batched(suspects, async (it) => {
+    const m = await it.getMetadata(META);
+    if (m && m.dimmed && m.orig) { dimmed[it.id] = m.orig; migrated++; }
+  });
+  if (migrated) await saveDimmed();
+
+  // État initial : tout actif, sauf si un estompage "couleur" est en cours
+  active = new Set(allIds().filter(id => {
     const its = items.filter(it => tagsOf(it).includes(id));
     return its.length === 0 || its.some(it => !isDimmed(it));
   }));
   render();
-  status(`${items.length} tickets, ${tags.length} tags.`);
+  status(`${items.length} tickets, ${tags.length} tags${veil ? ' — voile actif' : ''}.`);
 }
 
 function render() {
@@ -109,53 +157,114 @@ function render() {
   }
 }
 
+// ---------- Mode Voile ----------
+function boardBounds() {
+  // Uniquement les éléments de premier niveau (les enfants de frames ont des coordonnées relatives)
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const it of allItems) {
+    if (it.parentId || it.id === (veil && veil.id)) continue;
+    if (typeof it.x !== 'number' || typeof it.width !== 'number') continue;
+    const h = it.height || it.width;
+    x0 = Math.min(x0, it.x - it.width / 2); x1 = Math.max(x1, it.x + it.width / 2);
+    y0 = Math.min(y0, it.y - h / 2);        y1 = Math.max(y1, it.y + h / 2);
+  }
+  if (!isFinite(x0)) return { x: 0, y: 0, width: 10000, height: 10000 };
+  return { x: (x0 + x1) / 2, y: (y0 + y1) / 2, width: x1 - x0 + 2 * MARGIN, height: y1 - y0 + 2 * MARGIN };
+}
+
+async function removeVeil() {
+  if (!veil) return;
+  try { await withRetry(() => miro.board.remove(veil)); } catch (e) { console.warn(e); }
+  veil = null;
+  await withRetry(() => miro.board.setAppData(VEIL_KEY, null));
+}
+
+async function bringFront(list) {
+  if (!list.length) return;
+  try { await withRetry(() => miro.board.bringToFront(list)); }       // 1 appel pour toute la liste
+  catch (e) {                                                         // repli si la liste est refusée
+    console.warn('bringToFront(liste) refusé, repli par lots', e);
+    await batched(list, (it) => miro.board.bringToFront(it));
+  }
+}
+
+async function applyVeil() {
+  const shown = items.filter(shouldShow);
+  if (shown.length === items.length) { await removeVeil(); return 'voile retiré'; }
+  const opacity = parseFloat($('opacity').value);
+  if (!veil) {
+    veil = await withRetry(() => miro.board.createShape({
+      shape: 'rectangle', content: '', ...boardBounds(),
+      style: { fillColor: '#ffffff', fillOpacity: opacity, borderOpacity: 0, borderWidth: 1 },
+    }));
+    await withRetry(() => miro.board.setAppData(VEIL_KEY, veil.id));
+  } else {
+    if (veil.style.fillOpacity !== opacity) { veil.style.fillOpacity = opacity; await withRetry(() => veil.sync()); }
+    await withRetry(() => miro.board.bringToFront(veil));            // repasse devant les anciens tickets mis en avant
+  }
+  await bringFront(shown);
+  return `${shown.length} ticket(s) mis en avant`;
+}
+
+// ---------- Mode Recolorer ----------
+async function applyColor() {
+  const dim = $('dim').value;
+  const toDim = items.filter(it => !shouldShow(it) && !isDimmed(it));
+  const toShow = items.filter(it => shouldShow(it) && isDimmed(it));
+  if (toDim.length) { for (const it of toDim) dimmed[it.id] = colorOf(it); await saveDimmed(); }
+  await batched(toDim, async (it) => { setColor(it, it.type === 'card' ? CARD_DIM : dim); await it.sync(); });
+  await batched(toShow, async (it) => { setColor(it, dimmed[it.id]); await it.sync(); delete dimmed[it.id]; });
+  if (toShow.length) await saveDimmed();
+  return `${toDim.length} estompé(s), ${toShow.length} réaffiché(s)`;
+}
+
+async function restoreColors() {
+  const list = items.filter(isDimmed);
+  await batched(list, async (it) => { setColor(it, dimmed[it.id]); await it.sync(); delete dimmed[it.id]; });
+  if (list.length) await saveDimmed();
+}
+
+// ---------- Orchestration ----------
 async function apply() {
   if (busy) return;
   busy = true; document.querySelectorAll('button').forEach(b => b.disabled = true);
   render();
-  const dim = $('dim').value;
-  const shouldShow = (it) => tagsOf(it).some(id => active.has(id));
-  const toDim = items.filter(it => !shouldShow(it) && !isDimmed(it));
-  const toShow = items.filter(it => shouldShow(it) && isDimmed(it));
   try {
-    await batched([...toDim, ...toShow], async (it) => {
-      const m = meta.get(it.id) || {};
-      if (!m.dimmed) {
-        const orig = it.type === 'card' ? it.style.cardTheme : it.style.fillColor;
-        const next = { dimmed: true, orig };
-        await it.setMetadata(META, next);           // on mémorise d'abord la couleur d'origine
-        if (it.type === 'card') it.style.cardTheme = CARD_DIM; else it.style.fillColor = dim;
-        await it.sync();
-        meta.set(it.id, next);
-      } else {
-        if (it.type === 'card') it.style.cardTheme = m.orig; else it.style.fillColor = m.orig;
-        await it.sync();
-        await it.setMetadata(META, { dimmed: false });
-        meta.set(it.id, { dimmed: false });
-      }
-    });
-    status(`OK : ${toDim.length} estompé(s), ${toShow.length} réaffiché(s).`);
+    let msg;
+    if (mode() === 'veil') { await restoreColors(); msg = await applyVeil(); }
+    else { await removeVeil(); msg = await applyColor(); }
+    status('OK : ' + msg + '.');
   } catch (e) {
     console.error(e); status('Erreur : ' + (e.message || e));
+    try { await saveDimmed(); } catch (_) {}
   } finally {
     busy = false; document.querySelectorAll('button').forEach(b => b.disabled = false);
   }
 }
 
+function syncModeUI() {
+  $('veilOpts').hidden = mode() !== 'veil';
+  $('colorOpts').hidden = mode() !== 'color';
+}
+
 async function init() {
-  $('all').onclick = () => { active = new Set([...tags.map(t => t.id), NONE]); apply(); };
+  $('all').onclick = () => { active = new Set(allIds()); apply(); };
   $('none').onclick = () => { active = new Set(); apply(); };
-  $('refresh').onclick = load;
+  $('refresh').onclick = () => load().catch(e => status('Erreur : ' + (e.message || e)));
+  document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => { syncModeUI(); apply(); });
+  $('opacity').oninput = () => { $('opv').textContent = Math.round($('opacity').value * 100) + ' %'; };
+  $('opacity').onchange = () => { if (veil) apply(); };
+  syncModeUI();
   try { await load(); } catch (e) { console.error(e); status('Erreur : ' + (e.message || e)); }
 }
-// Démarrage : APRÈS toutes les déclarations (sinon erreur de "temporal dead zone")
+
+// Démarrage : APRÈS toutes les déclarations
 if (!IS_PANEL) {
-  // Page "headless" chargée par Miro : ouvre le panneau au clic sur l'icône de l'app
   miro.board.ui.on('icon:click', async () => {
     await miro.board.ui.openPanel({ url: 'index.html?panel=1' });
   });
 } else {
-  document.getElementById('panel').hidden = false;
+  $('panel').hidden = false;
   init();
 }
 </script>
