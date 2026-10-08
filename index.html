@@ -185,10 +185,17 @@ function boardBounds() {
 }
 
 async function removeVeil() {
-  if (!veil) return;
+  if (!veil) { await framesToBack(); return; }
   try { await withRetry(() => miro.board.remove(veil)); } catch (e) { console.warn(e); }
   veil = null;
   await withRetry(() => miro.board.setAppData(VEIL_KEY, null));
+  await framesToBack();
+}
+
+// Les frames repassent tout au fond, derrière leurs post-its (sinon les post-its envoyés
+// en arrière se retrouvent sous le fond de la frame et deviennent difficiles à sélectionner).
+async function framesToBack() {
+  if (frames.length) await sendBack(frames);
 }
 
 async function sendBack(list) {
@@ -217,6 +224,7 @@ async function applyVeil() {
   }
   await withRetry(() => miro.board.sendToBack(veil));   // voile tout au fond (les anciens estompés repassent devant)
   await sendBack(hidden);                               // puis les estompés actuels passent derrière le voile
+  await framesToBack();                                 // enfin les frames tout au fond : frames < estompés < voile < reste
   return `${hidden.length} ticket(s) estompé(s)`;
 }
 
