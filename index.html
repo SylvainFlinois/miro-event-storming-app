@@ -61,16 +61,6 @@ const CARD_DIM = '#e6e6e6';
 const TAG_COLORS = { red:'#f24726', magenta:'#da0063', violet:'#9510ac', light_green:'#c9df56', green:'#8fd14f',
   dark_green:'#0ca789', cyan:'#12cdd4', blue:'#2d9bf0', dark_blue:'#414bb2', yellow:'#fac710', gray:'#808080', black:'#1a1a1a' };
 
-if (!IS_PANEL) {
-  // Page "headless" chargée par Miro : ouvre le panneau au clic sur l'icône de l'app
-  miro.board.ui.on('icon:click', async () => {
-    await miro.board.ui.openPanel({ url: 'index.html?panel=1' });
-  });
-} else {
-  document.getElementById('panel').hidden = false;
-  init();
-}
-
 let tags = [], items = [], meta = new Map(), active = new Set(), busy = false;
 const $ = (id) => document.getElementById(id);
 const status = (t) => $('status').textContent = t;
@@ -157,6 +147,16 @@ async function init() {
   $('none').onclick = () => { active = new Set(); apply(); };
   $('refresh').onclick = load;
   try { await load(); } catch (e) { console.error(e); status('Erreur : ' + (e.message || e)); }
+}
+// Démarrage : APRÈS toutes les déclarations (sinon erreur de "temporal dead zone")
+if (!IS_PANEL) {
+  // Page "headless" chargée par Miro : ouvre le panneau au clic sur l'icône de l'app
+  miro.board.ui.on('icon:click', async () => {
+    await miro.board.ui.openPanel({ url: 'index.html?panel=1' });
+  });
+} else {
+  document.getElementById('panel').hidden = false;
+  init();
 }
 </script>
 </body>
