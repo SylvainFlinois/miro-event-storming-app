@@ -195,7 +195,11 @@ async function bringFront(list) {
   try { await withRetry(() => miro.board.bringToFront(list)); }       // 1 appel pour toute la liste
   catch (e) {                                                         // repli si la liste est refusée
     console.warn('bringToFront(liste) refusé, repli par lots', e);
-    await batched(list, (it) => miro.board.bringToFront(it));
+    // un élément introuvable (supprimé entre-temps) ne doit pas bloquer les autres
+    await batched(list, (it) => miro.board.bringToFront(it).catch(err => {
+      if (/rate.?limit|too many/i.test(String(err && err.message || err))) throw err;
+      console.warn('ignoré', it.id, err);
+    }));
   }
 }
 
@@ -366,6 +370,11 @@ async function apply() {
   busy = true; document.querySelectorAll('button').forEach(b => b.disabled = true);
   render();
   try {
+    // Toujours repartir de l'état réel du board (éléments ajoutés / supprimés depuis le chargement)
+    allItems = await withRetry(() => miro.board.get());
+    items = allItems.filter(it => it.type === 'sticky_note' || it.type === 'card');
+    frames = allItems.filter(it => it.type === 'frame');
+    if (veil) veil = allItems.find(it => it.id === veil.id) || null;
     let msg;
     if (mode() === 'veil') { await restoreColors(); msg = await applyVeil(); }
     else { await removeVeil(); msg = await applyColor(); }
