@@ -353,15 +353,8 @@ async function onSelection(ev) {
   const coll = await getColl();
   const frameId = Object.keys(coll).find(id => coll[id].btn === sel[0].id);
   if (!frameId) return;
-  // L'écoute tourne à la fois en arrière-plan ET dans le panneau (Miro ne transmet pas toujours
-  // les événements à l'arrière-plan). Un verrou partagé évite de replier puis redéplier aussitôt.
-  const run = async () => {
-    try { await miro.board.deselect(); } catch (_) {}
-    await toggleFrame(frameId);
-    await sleep(2000);                 // garde le verrou le temps que l'autre écouteur abandonne
-  };
-  if (navigator.locks) await navigator.locks.request('toggle-' + frameId, { ifAvailable: true }, (lock) => lock ? run() : null);
-  else await run();
+  try { await miro.board.deselect(); } catch (_) {}
+  await toggleFrame(frameId);
 }
 
 // Entrée « Rendre repliable » dans le menu « … » d'une frame (API expérimentale de Miro)
@@ -429,7 +422,6 @@ async function init() {
   $('opacity').oninput = () => { $('opv').textContent = Math.round($('opacity').value * 100) + ' %'; };
   $('opacity').onchange = () => { if (veils.length) apply(); };
   syncModeUI();
-  miro.board.ui.on('selection:update', (ev) => onSelection(ev).catch(e => status('Erreur bouton : ' + (e.message || e))));
   try { await load(); } catch (e) { console.error(e); status('Erreur : ' + (e.message || e)); }
 }
 
